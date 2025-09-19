@@ -29,22 +29,28 @@ type loggable interface {
 }
 
 type Timeouts struct {
-	IdleTimeout  time.Duration
-	ReadTimeout  time.Duration
-	WriteTimeout time.Duration
+	IdleTimeout     time.Duration
+	ReadTimeout     time.Duration
+	WriteTimeout    time.Duration
+	ShutdownTimeout time.Duration
 }
 
 var defaultTimeouts = Timeouts{
-	IdleTimeout:  time.Minute,
-	ReadTimeout:  10 * time.Second,
-	WriteTimeout: 30 * time.Second,
+	IdleTimeout:     time.Minute,
+	ReadTimeout:     10 * time.Second,
+	WriteTimeout:    30 * time.Second,
+	ShutdownTimeout: 5 * time.Second,
 }
 
-func ListenAndServe(serve Interface, port int) error {
+func ListenAndServe(servable Interface, port int) error {
+	return ListenAndServeWithTimeouts(servable, port, Timeouts{ShutdownTimeout: 5 * time.Second})
+}
+
+func ListenAndServeDefaultTimeouts(serve Interface, port int) error {
 	return ListenAndServeWithTimeouts(serve, port, defaultTimeouts)
 }
 
-func newServer(serve Interface, port int, tOut Timeouts) *S {
+func newS(serve Interface, port int, tOut Timeouts) *S {
 	httpServer := &http.Server{
 		Addr:         fmt.Sprintf(":%d", port),
 		Handler:      serve.Routes(),
@@ -57,29 +63,33 @@ func newServer(serve Interface, port int, tOut Timeouts) *S {
 	return &S{
 		httpServer: httpServer,
 		shutdown:   make(chan error),
+		logger:     serve,
+		done:       make(chan struct{}),
 	}
 }
 
 type S struct {
-	httpServer *http.Server
-	shutdown   chan error
+	httpServer      *http.Server
+	shutdown        chan error
+	logger          loggable
+	done            chan struct{}
+	shutdownTimeout time.Duration
 }
 
 func ListenAndServeWithTimeouts(servable Interface, port int, tOut Timeouts) error {
-	shutdownError := make(chan error)
+	s := newS(servable, port, tOut)
 
-	s := newServer(servable, port, tOut)
-
-	go s.listenForSignals(shutdownError, syscall.SIGINT, syscall.SIGTERM)
+	go s.listenForSignals(syscall.SIGINT, syscall.SIGTERM)
 
 	servable.LogStartUp()
 
 	err := s.httpServer.ListenAndServe()
 	if !errors.Is(err, http.ErrServerClosed) {
+		close(s.done)
 		return err
 	}
 
-	err = <-shutdownError
+	err = <-s.shutdown
 	if err != nil {
 		return err
 	}
@@ -89,23 +99,23 @@ func ListenAndServeWithTimeouts(servable Interface, port int, tOut Timeouts) err
 	return nil
 }
 
-var InfoLog interface {
-	PrintInfo(msg string, properties map[string]string)
-}
-
-func (s *S) listenForSignals(shutdown chan<- error, sigs ...os.Signal) {
+func (s *S) listenForSignals(sigs ...os.Signal) {
 	quit := make(chan os.Signal, 1)
 
 	signal.Notify(quit, sigs...)
+	defer signal.Stop(quit)
 
-	sig := <-quit
+	select {
+	case sig := <-quit:
+		s.logger.PrintInfo("shutting down server", map[string]string{
+			"signal": sig.String(),
+		})
+	case <-s.done:
+		return
+	}
 
-	InfoLog.PrintInfo("shutting down server", map[string]string{
-		"signal": sig.String(),
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
 	defer cancel()
 
-	shutdown <- s.httpServer.Shutdown(ctx)
+	s.shutdown <- s.httpServer.Shutdown(ctx)
 }
